@@ -22,6 +22,7 @@ using System.ComponentModel;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Diagnostics;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 using ConsoleHandle = Microsoft.Win32.SafeHandles.SafeFileHandle;
@@ -41,6 +42,7 @@ using System.IO.Pipes;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using Dbg = System.Management.Automation.Diagnostics;
+using System.Reflection.Metadata;
 
 namespace Microsoft.PowerShell
 {
@@ -2520,9 +2522,30 @@ namespace Microsoft.PowerShell
         }
 
         #endregion Window
+        
+        private static StringBuilder _buffer = new();
+        private static Timer _timer = new(_ =>
+        {
+            var str = ReadOnlySpan<char>.Empty;
 
-        private static AnonymousPipeServerStream _tx = new(PipeDirection.Out, HandleInheritability.None, 128 * 1024);
-        private static bool _writerStarted;
+            lock (_buffer)
+            {
+                if (_buffer.Length > 0)
+                {
+                    str = _buffer.ToString().AsSpan();
+                    _buffer.Clear();
+                }
+            }
+
+            if (!str.IsEmpty)
+            {
+                var handle = GetActiveScreenBufferHandle();
+                if (!NativeMethods.WriteConsole(handle.DangerousGetHandle(), str, (uint)str.Length, out var written, IntPtr.Zero))
+                {
+                    throw new System.ComponentModel.Win32Exception();
+                }
+            }
+        }, null, 10, 10);
 
         /// <summary>
         /// Wrap Win32 WriteConsole.
@@ -2543,52 +2566,31 @@ namespace Microsoft.PowerShell
         {
             Dbg.Assert(!consoleHandle.IsInvalid, "ConsoleHandle is not valid");
             Dbg.Assert(!consoleHandle.IsClosed, "ConsoleHandle is closed");
+            
+            var str = ReadOnlySpan<char>.Empty;
 
-            if (!_writerStarted)
+            lock (_buffer)
             {
-                _writerStarted = true;
-
-                var rx = new AnonymousPipeClientStream(PipeDirection.In, _tx.ClientSafePipeHandle);
-
-                var t = new Thread(void () =>
+                _buffer.Append(output);
+                if (newLine)
                 {
-                    var buffer = new byte[128 * 1024];
+                    _buffer.Append(Environment.NewLine);
+                }
 
-                    while (true)
-                    {
-                        var read = rx.Read(buffer);
-                        if (read == 0)
-                        {
-                            break;
-                        }
-
-                        unsafe
-                        {
-                            fixed (byte* h = buffer)
-                            {
-                                var s = new ReadOnlySpan<char>(h, read / 2);
-                                var handle = GetActiveScreenBufferHandle();
-
-                                if (!NativeMethods.WriteConsole(handle.DangerousGetHandle(), s, (uint)s.Length, out var written, IntPtr.Zero))
-                                {
-                                    throw new System.ComponentModel.Win32Exception();
-                                }
-                            }
-                        }
-                    }
-                });
-                t.Start();
+                if (_buffer.Length >= 128 * 1024)
+                {
+                    str = _buffer.ToString().AsSpan();
+                    _buffer.Clear();
+                }
             }
 
-            if (output.IsEmpty && !newLine)
+            if (!str.IsEmpty)
             {
-                return;
-            }
-
-            _tx.Write(MemoryMarshal.AsBytes(output));
-            if (newLine)
-            {
-                _tx.Write(MemoryMarshal.AsBytes(Environment.NewLine.AsSpan()));
+                var handle = GetActiveScreenBufferHandle();
+                if (!NativeMethods.WriteConsole(handle.DangerousGetHandle(), str, (uint)str.Length, out var written, IntPtr.Zero))
+                {
+                    throw new System.ComponentModel.Win32Exception();
+                }
             }
         }
 
