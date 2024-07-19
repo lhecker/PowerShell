@@ -36,6 +36,10 @@ using HDC = System.IntPtr;
 #endif
 
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using Dbg = System.Management.Automation.Diagnostics;
 
 namespace Microsoft.PowerShell
@@ -2517,6 +2521,9 @@ namespace Microsoft.PowerShell
 
         #endregion Window
 
+        private static AnonymousPipeServerStream _tx = new(PipeDirection.Out, HandleInheritability.None, 128 * 1024);
+        private static bool _writerStarted;
+
         /// <summary>
         /// Wrap Win32 WriteConsole.
         /// </summary>
@@ -2532,94 +2539,56 @@ namespace Microsoft.PowerShell
         /// <exception cref="HostException">
         /// If the Win32's WriteConsole fails.
         /// </exception>
-        internal static void WriteConsole(ConsoleHandle consoleHandle, ReadOnlySpan<char> output, bool newLine)
+        internal static void WriteConsole(ConsoleHandle consoleHandle, ReadOnlySpan<char> output, bool newLine = false)
         {
             Dbg.Assert(!consoleHandle.IsInvalid, "ConsoleHandle is not valid");
             Dbg.Assert(!consoleHandle.IsClosed, "ConsoleHandle is closed");
 
-            if (output.Length == 0)
+            if (!_writerStarted)
             {
-                if (newLine)
-                {
-                    WriteConsole(consoleHandle, Environment.NewLine);
-                }
+                _writerStarted = true;
 
+                var rx = new AnonymousPipeClientStream(PipeDirection.In, _tx.ClientSafePipeHandle);
+
+                var t = new Thread(void () =>
+                {
+                    var buffer = new byte[128 * 1024];
+
+                    while (true)
+                    {
+                        var read = rx.Read(buffer);
+                        if (read == 0)
+                        {
+                            break;
+                        }
+
+                        unsafe
+                        {
+                            fixed (byte* h = buffer)
+                            {
+                                var s = new ReadOnlySpan<char>(h, read / 2);
+                                var handle = GetActiveScreenBufferHandle();
+
+                                if (!NativeMethods.WriteConsole(handle.DangerousGetHandle(), s, (uint)s.Length, out var written, IntPtr.Zero))
+                                {
+                                    throw new System.ComponentModel.Win32Exception();
+                                }
+                            }
+                        }
+                    }
+                });
+                t.Start();
+            }
+
+            if (output.IsEmpty && !newLine)
+            {
                 return;
             }
 
-            // Native WriteConsole doesn't support output buffer longer than 64K, so we need to chop the output string if it is too long.
-            // This records the chopping position in output string.
-            int cursor = 0;
-            // This is 64K/4 - 1 to account for possible width of each character.
-            const int MaxBufferSize = 16383;
-            const int MaxStackAllocSize = 512;
-            ReadOnlySpan<char> outBuffer;
-
-            // In case that a new line is required, we try to write out the last chunk and the new-line string together,
-            // to avoid one extra call to 'WriteConsole' just for a new line string.
-            while (cursor + MaxBufferSize < output.Length)
+            _tx.Write(MemoryMarshal.AsBytes(output));
+            if (newLine)
             {
-                outBuffer = output.Slice(cursor, MaxBufferSize);
-                cursor += MaxBufferSize;
-                WriteConsole(consoleHandle, outBuffer);
-            }
-
-            outBuffer = output.Slice(cursor);
-            if (!newLine)
-            {
-                WriteConsole(consoleHandle, outBuffer);
-                return;
-            }
-
-            char[] rentedArray = null;
-            string lineEnding = Environment.NewLine;
-            int size = outBuffer.Length + lineEnding.Length;
-
-            // We expect the 'size' will often be small, and thus optimize that case with 'stackalloc'.
-            Span<char> buffer = size <= MaxStackAllocSize ? stackalloc char[size] : default;
-
-            try
-            {
-                if (buffer.IsEmpty)
-                {
-                    rentedArray = ArrayPool<char>.Shared.Rent(size);
-                    buffer = rentedArray.AsSpan().Slice(0, size);
-                }
-
-                outBuffer.CopyTo(buffer);
-                lineEnding.CopyTo(buffer.Slice(outBuffer.Length));
-                WriteConsole(consoleHandle, buffer);
-            }
-            finally
-            {
-                if (rentedArray is not null)
-                {
-                    ArrayPool<char>.Shared.Return(rentedArray);
-                }
-            }
-        }
-
-        private static void WriteConsole(ConsoleHandle consoleHandle, ReadOnlySpan<char> buffer)
-        {
-            DWORD charsWritten;
-            bool result =
-                NativeMethods.WriteConsole(
-                    consoleHandle.DangerousGetHandle(),
-                    buffer,
-                    (DWORD)buffer.Length,
-                    out charsWritten,
-                    IntPtr.Zero);
-
-            if (!result)
-            {
-                int err = Marshal.GetLastWin32Error();
-
-                HostException e = CreateHostException(
-                    err,
-                    "WriteConsole",
-                    ErrorCategory.WriteError,
-                    ConsoleControlStrings.WriteConsoleExceptionTemplate);
-                throw e;
+                _tx.Write(MemoryMarshal.AsBytes(Environment.NewLine.AsSpan()));
             }
         }
 

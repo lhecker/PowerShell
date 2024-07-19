@@ -336,9 +336,7 @@ namespace Microsoft.PowerShell
         {
             get
             {
-                ConsoleControl.CONSOLE_SCREEN_BUFFER_INFO bufferInfo;
-                GetBufferInfo(out bufferInfo);
-                return new Size(bufferInfo.BufferSize.X, bufferInfo.BufferSize.Y);
+                return new Size(120, 9001);
             }
 
             set
@@ -387,15 +385,7 @@ namespace Microsoft.PowerShell
         {
             get
             {
-                ConsoleControl.CONSOLE_SCREEN_BUFFER_INFO bufferInfo;
-                GetBufferInfo(out bufferInfo);
-
-                Size s =
-                    new Size(
-                        bufferInfo.WindowRect.Right - bufferInfo.WindowRect.Left + 1,
-                        bufferInfo.WindowRect.Bottom - bufferInfo.WindowRect.Top + 1);
-
-                return s;
+                return new Size(120, 30);
             }
 
             set
